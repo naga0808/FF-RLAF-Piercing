@@ -1,4 +1,4 @@
-name: RLAF&Pierce
+name: Piercing
 description: Performs piercing (fine-tuning) on the FFN model using symbolic patching with piercing parameters.
 inputs:
   - {name: trained_model, type: Model}
@@ -334,7 +334,7 @@ implementation:
             pierce_params = {
                             "epochs": pierce_parameters.get('epochs', 5),
                             "expected_accuracy": expected_accuracy,
-                            # "optimiser_class": Adam,
+                            "optimiser_class": Adam,
                             "optimiser_params": {
                                 "learning_rate": pierce_parameters.get('lr', 0.03),
                                 "beta_1": pierce_parameters.get('b1', 0.9 ),
