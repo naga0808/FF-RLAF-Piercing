@@ -149,11 +149,8 @@ implementation:
         
         pierce_decision = True # Default to true for initial run or if baseline not met
         
-        if accuracy >= prev_accuracy and accuracy<baseline_accuracy:
-            pierce_decision = True
-        else:
-            pierce_decision = False
-            
+        
+
         # Get pierce2rlaf data and find the latest entry
         pierce2rlaf_data = db_data["content"][0].get("pierce2rlaf", [])
         
@@ -220,6 +217,12 @@ implementation:
         action_with_prob["probability"] = round(top_probs[0].item(), 4)
         top_actions_list.append(action_with_prob)
 
+
+        if accuracy >= prev_accuracy and accuracy<baseline_accuracy:
+            pierce_decision = True
+        else:
+            pierce_decision = False
+            
         # Append to rlaf2pierce in DB
         current_timestamp = str(int(time.time()))
         new_rlaf2pierce_entry = {
