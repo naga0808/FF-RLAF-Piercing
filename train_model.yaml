@@ -3,7 +3,7 @@ description: Compiles and trains the FFN model using the training dataset and sa
 inputs:
   - {name: ff_model, type: Model}
   - {name: train_dataset, type: Dataset}
-  - {name: num_epochs, type: int}
+  - {name: num_epochs, type: Integer}
 outputs:
   - {name: trained_model, type: Model}
 implementation:
