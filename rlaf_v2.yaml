@@ -1,10 +1,10 @@
 name: RLAF Combined Policy and Action Selection
 description: Returns top 3 actions based on probability and a boolean to pierce or not, considering initial run or policy update.
-inputs:
-  - name: pierced_rewards
-    type: String
-  - name: baseline_reward
-    type: Float
+# inputs:
+#   - name: pierced_rewards
+#     type: String
+#   - name: baseline_reward
+#     type: Float
 outputs:
   - name: pierce_or_not
     type: Boolean
@@ -199,10 +199,10 @@ implementation:
             f.write(json.dumps(top_actions_list))
 
     args:
-      - --pierced_rewards
-      - {inputPath: pierced_rewards}
-      - --baseline_reward
-      - {inputPath: baseline_reward}
+      # - --pierced_rewards
+      # - {inputPath: pierced_rewards}
+      # - --baseline_reward
+      # - {inputPath: baseline_reward}
       - --pierce_or_not
       - {outputPath: pierce_or_not}
       - --top_3_actions
