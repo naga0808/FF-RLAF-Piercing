@@ -1,0 +1,341 @@
+name: RLAF&Pierce
+description: Performs piercing (fine-tuning) on the FFN model using symbolic patching with piercing parameters.
+inputs:
+  - {name: trained_model, type: Model}
+  - {name: x_pierce_splits, type: Dataset}
+  - {name: y_pierce_splits, type: Dataset}
+outputs:
+  - {name: pierced_model, type: Model}
+implementation:
+  container:
+    image: python:3.9
+    command:
+      - sh
+      - -c
+      - |
+        python3 -m pip install --quiet tensorflow keras scikit-learn numpy || \
+        python3 -m pip install --quiet tensorflow keras scikit-learn numpy --user
+        exec "$0" "$@"
+      - python3
+      - -u
+      - -c
+      - |
+        import os
+        import glob
+        import json
+        import pickle
+        import argparse
+        import zipfile
+        import tarfile
+        
+        import numpy as np
+        import tensorflow as tf
+        from tensorflow.compiler.tf2xla.python import xla
+        from sklearn.metrics import accuracy_score
+        from sklearn.model_selection import train_test_split
+        
+        import keras
+        from keras import ops
+        from keras.optimizers import Adam
+        from keras.models import load_model, model_from_json
+        
+        tf.config.run_functions_eagerly(True)
+
+
+        
+        class FFDense(keras.layers.Layer):
+            def __init__(self, units, init_optimizer, loss_metric, num_epochs=50,
+                         use_bias=True, kernel_initializer="glorot_uniform",
+                         bias_initializer="zeros", kernel_regularizer=None,
+                         bias_regularizer=None, **kwargs):
+                super().__init__(**kwargs)
+                self.dense = keras.layers.Dense(
+                                                units,
+                                                activation=None,  # or explicitly specify if needed
+                                                use_bias=use_bias,
+                                                kernel_initializer=kernel_initializer,
+                                                bias_initializer=bias_initializer,
+                                                kernel_regularizer=kernel_regularizer,
+                                                bias_regularizer=bias_regularizer
+                                                )
+                self.relu = keras.layers.ReLU()
+                self.optimizer = init_optimizer()
+                self.loss_metric = loss_metric
+                self.threshold = 1.5
+                self.num_epochs = num_epochs
+
+            def call(self, x):
+                x_norm = ops.norm(x, ord=2, axis=1, keepdims=True) + 1e-4
+                x_dir = x / x_norm
+                res = self.dense(x_dir)
+                return self.relu(res)
+
+            def forward_forward(self, x_pos, x_neg):
+                for _ in range(self.num_epochs):
+                    with tf.GradientTape() as tape:
+                        g_pos = ops.mean(ops.power(self.call(x_pos), 2), 1)
+                        g_neg = ops.mean(ops.power(self.call(x_neg), 2), 1)
+                        loss = ops.log(1 + ops.exp(ops.concatenate([-g_pos + self.threshold,
+                                                                    g_neg - self.threshold], 0)))
+                        mean_loss = ops.cast(ops.mean(loss), dtype="float32")
+                        self.loss_metric.update_state([mean_loss])
+                    grads = tape.gradient(mean_loss, self.dense.trainable_weights)
+                    self.optimizer.apply_gradients(zip(grads, self.dense.trainable_weights))
+                return ops.stop_gradient(self.call(x_pos)), ops.stop_gradient(self.call(x_neg)), self.loss_metric.result()
+
+        class FFNetwork(keras.Model):
+            def __init__(self, dims, init_layer_optimizer=lambda: keras.optimizers.Adam(0.03), **kwargs):
+                super().__init__(**kwargs)
+                self.init_layer_optimizer = init_layer_optimizer
+                self.loss_var = keras.Variable(0.0, trainable=False, dtype="float32")
+                self.loss_count = keras.Variable(0.0, trainable=False, dtype="float32")
+                self.layer_list = [keras.Input(shape=(dims[0],))]
+                self.metrics_built = False
+                for d in range(len(dims) - 1):
+                    self.layer_list.append(
+                        FFDense(dims[d + 1],
+                                init_optimizer=self.init_layer_optimizer,
+                                loss_metric=keras.metrics.Mean())
+                    )
+
+            @tf.function(reduce_retracing=True)
+            def overlay_y_on_x(self, data):
+                X_sample, y_sample = data
+                max_sample = ops.cast(ops.amax(X_sample, axis=0, keepdims=True), dtype="float64")
+                X_zeros = ops.zeros([10], dtype="float64")
+                X_update = xla.dynamic_update_slice(X_zeros, max_sample, [y_sample])
+                X_sample = xla.dynamic_update_slice(X_sample, X_update, [0])
+                return X_sample, y_sample
+
+            @tf.function(reduce_retracing=True)
+            def predict_one_sample(self, x):
+                goodness_per_label = []
+                x = ops.reshape(x, [ops.shape(x)[0] * ops.shape(x)[1]])
+                for label in range(10):
+                    h, _ = self.overlay_y_on_x((x, label))
+                    h = ops.reshape(h, [-1, ops.shape(h)[0]])
+                    goodness = []
+                    for layer in self.layer_list[1:]:
+                        h = layer(h)
+                        goodness.append(ops.mean(ops.power(h, 2), 1))
+                    goodness_per_label.append(ops.expand_dims(ops.sum(goodness, keepdims=True), 1))
+                return ops.cast(ops.argmax(tf.concat(goodness_per_label, 1), 1), dtype="float64")
+
+            def predict(self, data):
+                x = data
+                preds = list()
+                preds = ops.vectorized_map(self.predict_one_sample, x)
+                return np.asarray(preds, dtype=int)
+
+            # def predict(self, data):
+            #     return ops.vectorized_map(self.predict_one_sample, data).numpy().astype(int)
+            # def predict(self, data):
+            #     # Avoid .numpy() inside graph context
+            #     predictions = tf.vectorized_map(self.predict_one_sample, data)
+            #     return tf.cast(tf.argmax(predictions, axis=-1), tf.int32)
+                
+            def update_pierce_params(self, pierce_params):
+                self.optimiser = pierce_params.get("optimiser", keras.optimizers.Adam(learning_rate=0.03))
+                self.threshold = pierce_params.get("threshold", 1.5)
+                # for layer in self.layer_list:
+                #     if hasattr(layer, "optimizer"):
+                #         layer.optimizer = self.optimiser
+                for layer in self.layer_list:
+                    if isinstance(layer, FFDense):
+                        layer.optimizer = pierce_params["optimiser_class"](**pierce_params["optimiser_params"])
+
+
+            @tf.function(jit_compile=False)
+            def train_step(self, data):
+                x, y = data
+                if not self.metrics_built:
+                    for metric in self.metrics:
+                        if hasattr(metric, "build"):
+                            metric.build(y, y)
+                    self.metrics_built = True
+                x = ops.reshape(x, [-1, ops.shape(x)[1] * ops.shape(x)[2]])
+                x_pos, y = ops.vectorized_map(self.overlay_y_on_x, (x, y))
+                random_y = tf.random.shuffle(y)
+                x_neg, _ = tf.map_fn(self.overlay_y_on_x, (x, random_y))
+                h_pos, h_neg = x_pos, x_neg
+                for layer in self.layers:
+                    if isinstance(layer, FFDense):
+                        h_pos, h_neg, loss = layer.forward_forward(h_pos, h_neg)
+                        self.loss_var.assign_add(loss)
+                        self.loss_count.assign_add(1.0)
+                    else:
+                        h_pos = layer(h_pos)
+                return {"FinalLoss": self.loss_var / self.loss_count}
+
+
+        
+        # -----------------------
+        # Helper functions
+        # -----------------------
+        def data_prep(x_train, x_test, y_train, y_test):
+            x_train = x_train.astype(float) / 255
+            x_test = x_test.astype(float) / 255
+            y_train = y_train.astype(int)
+            y_test = y_test.astype(int)
+            train_dataset = tf.data.Dataset.from_tensor_slices((x_train, y_train)).batch(len(x_train))
+            test_dataset = tf.data.Dataset.from_tensor_slices((x_test, y_test)).batch(len(x_test))
+            return train_dataset, test_dataset
+
+        def get_accuracy(model, x_test, y_test):
+            preds = model.predict(x_test)
+            # preds = preds.reshape((preds.shape[0], preds.shape[1]))
+            preds = tf.reshape(preds, [tf.shape(preds)[0], tf.shape(preds)[1]])
+
+            results = accuracy_score(preds, y_test)
+            print(f"Test Accuracy score : {results * 100}%")
+            return results
+
+        def RLAF(accuracy, prev_accuracy):
+            pierce_params = {
+                "epochs": np.random.randint(2, 11),
+                "expected_accuracy": 0.9,
+                "optimiser_class": Adam,
+                "optimiser_params": {
+                    "learning_rate": np.random.uniform(0.001, 0.01),
+                    "beta_1": np.random.uniform(0.9, 0.99),
+                    "beta_2": np.random.uniform(0.99, 0.9999)
+                },
+                "pierce_model" : False
+            }
+            print(f"The expected accuracy is {pierce_params['expected_accuracy']}")
+            print(f"The current accuracy is {accuracy}")
+            if accuracy < pierce_params['expected_accuracy'] :
+                print("The required accuracy haven't been achieved. Continuing to pierce")
+                
+            if accuracy < prev_accuracy: 
+                print("The accuracy isn't improving even after piercing. It seems the maximum achievable accuracy have reached for the model with this data. So piercing is stopped")
+        
+            if accuracy < pierce_params['expected_accuracy'] and accuracy > prev_accuracy :
+                pierce_params["pierce_model"] = True 
+        
+            return pierce_params
+                
+        
+        def pierce_model(model, new_x, new_y):
+            
+            x_train, x_test, y_train, y_test = train_test_split(
+            new_x, new_y, test_size=0.3, random_state=42, stratify=new_y
+        )
+            train_dataset, test_dataset = data_prep(x_train, x_test, y_train, y_test)
+            x_test = x_test.astype(float) / 255
+            y_test = y_test.astype(int)
+            accuracy = get_accuracy(model, x_test,y_test)
+            prev_accuracy = 0
+            pierce_params = RLAF(accuracy, prev_accuracy)
+            while pierce_params['pierce_model']:
+                epochs = pierce_params.get("epochs", 5)
+                model.update_pierce_params(pierce_params)
+                history = model.fit(train_dataset, epochs=epochs)
+                accuracy = get_accuracy(model, x_test,y_test)
+                pierce_params = RLAF(accuracy, prev_accuracy)
+                prev_accuracy = accuracy
+        
+        # def pierce_model(model, new_x, new_y, pierce_params):
+        #     model.update_pierce_params(pierce_params)
+        #     epochs = pierce_params.get("epochs", 5)
+        #     required_accuracy = pierce_params.get("accuracy", 0.9)
+
+        #     x_train, x_test, y_train, y_test = train_test_split(
+        #         new_x, new_y, test_size=0.3, random_state=42, stratify=new_y
+        #     )
+        #     train_dataset, _ = data_prep(x_train, x_test, y_train, y_test)
+
+        #     model.fit(train_dataset, epochs=epochs)
+        #     prev_accuracy = 0
+        #     x_test = x_test.astype(float) / 255
+        #     y_test = y_test.astype(int)
+        #     accuracy = get_accuracy(model, x_test, y_test)
+        #     print(f"the expected accuracy{required_accuracy}")
+        #     print(f"The obtained accuracy {accuracy}")
+        #     while accuracy < required_accuracy and accuracy > prev_accuracy:
+        #         prev_accuracy = accuracy
+        #         params = pierce_params["optimiser_params"]
+        #         params["learning_rate"] = np.random.uniform(0.005, 0.05)
+        #         params["beta_1"] = np.random.uniform(0.9, 0.99)
+        #         params["beta_2"] = np.random.uniform(0.99, 0.9999)
+        #         pierce_params["optimiser"] = pierce_params["optimiser_class"](**params)
+        #         model.update_pierce_params(pierce_params)
+        #         model.fit(train_dataset, epochs=epochs)
+        #         accuracy = get_accuracy(model, x_test, y_test)
+        #         print(f"the expected accuracy{required_accuracy}")
+        #         print(f"The obtained accuracy {accuracy}")
+
+        # -----------------------
+        # Main script
+        # -----------------------
+        
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--trained_model', type=str, required=True)
+        parser.add_argument('--x_pierce_splits', type=str, required=True)
+        parser.add_argument('--y_pierce_splits', type=str, required=True)
+        parser.add_argument('--pierced_model', type=str, required=True)
+        args = parser.parse_args()
+
+        print(f"the trained model path is {args.trained_model}")
+        zip_path = args.trained_model
+        extract_path = "/tmp/trained_model_extracted"
+        
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(extract_path)
+        
+        with open(os.path.join(extract_path, "config.json"), "r") as f:
+            model_json = f.read()
+        
+        # model = model_from_json(model_json)
+        model = FFNetwork([784, 500, 500])
+        model.build(input_shape=(None, 784))
+        model.load_weights(os.path.join(extract_path, "model.weights.h5"))
+
+        
+        model.compile(
+            optimizer=keras.optimizers.Adam(learning_rate=0.03),
+            loss="mse",
+            jit_compile=False,
+            metrics=[],
+        )
+
+        # Load data
+        x_splits = np.load(args.x_pierce_splits, allow_pickle=True)
+        y_splits = np.load(args.y_pierce_splits, allow_pickle=True)
+
+        # Define piercing parameters
+        # pierce_params = {
+        #     "epochs": 5,
+        #     "accuracy": 0.5,
+        #     "optimiser_class": Adam,
+        #     "optimiser_params": {
+        #         "learning_rate": 0.01,
+        #         "beta_1": 0.9,
+        #         "beta_2": 0.99
+        #     }
+        # }
+
+        # Perform piercing on each split
+        new_data_id = 1
+        for new_x, new_y in zip(x_splits, y_splits):
+            print(f"the new_data {new_data_id} arrived for piercing")
+            # pierce_model(model, new_x, new_y, pierce_params)
+            pierce_model(model, new_x, new_y)
+            break
+            
+
+        # Save final pierced model
+        os.makedirs(os.path.dirname(args.pierced_model), exist_ok=True)
+        model.save(args.pierced_model + ".keras")   # args.pierced_model should be a directory path
+        os.rename(args.pierced_model + ".keras", args.pierced_model)
+    args:
+      - --trained_model
+      - {inputPath: trained_model}
+      # - /tmp/outputs/trained_model/data.keras
+      - --x_pierce_splits
+      - {inputPath: x_pierce_splits}
+      - --y_pierce_splits
+      - {inputPath: y_pierce_splits}
+      - --pierced_model
+      - {outputPath: pierced_model}
+      # - /tmp/outputs/pierced_model/data.keras
