@@ -276,6 +276,103 @@ implementation:
             response = requests.post(instances_url, headers=headers, json=payload)
             return response.json()
 
+        def update_instance(access_token, instance_id, field_to_update, new_value):
+            update_url = "https://ig.aidtaas.com/pi-entity-instances-service/v2.0/schemas/685a9dcd08232436a767c98a/instances"
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "dbType": "TIDB",
+                "conditionalFilter": {
+                    "conditions": [
+                        {
+                            "field": "id",
+                            "operator": "EQUAL",
+                            "value": instance_id
+                        }
+                    ]
+                },
+                "partialUpdateRequests": [
+                    {
+                        "patch": [
+                            {
+                                "operation": "REPLACE",
+                                "path": field_to_update,
+                                "value": new_value
+                            }
+                        ]
+                    }
+                ]
+            }
+            response = requests.patch(update_url, headers=headers, json=payload)
+            response.raise_for_status() # Raise an exception for HTTP errors
+            return response.json()
+
+
+
+        def append_to_pierce2rfal(access_token, new_entry):
+            current_data = get_instances(access_token)
+            instance = current_data["content"][0]
+            instance["pierce2rfal"].append(new_entry)
+            update_instance(access_token, instance["id"], "pierce2rfal", instance["pierce2rfal"])
+            print("Appended to pierce2rfal successfully.")
+
+
+        def get_pierce_params():
+            token = get_access_token()
+
+            rlaf_to_pierce_data = get_instances(token)
+            print(json.dumps(rlaf_to_pierce_data["content"], indent=4))
+            expected_accuracy = rlaf_to_pierce_data["content"][-1].get("baseline_score", 0.9)
+            pierce_data = rlaf_to_pierce_data['content'][-1]["rlaf2pierce"][-1]
+
+            print(pierce_data)
+            pierce_parameters = pierce_data['actions'][-1]
+            pierce_or_not = pierce_data.get("pierce_or_not", "false")
+
+            pierce_params = {
+                            "epochs": pierce_parameters.get('epochs', 5),
+                            "expected_accuracy": expected_accuracy,
+                            # "optimiser_class": Adam,
+                            "optimiser_params": {
+                                "learning_rate": pierce_parameters.get('lr', 0.03),
+                                "beta_1": pierce_parameters.get('b1', 0.9 ),
+                                "beta_2": pierce_parameters.get('b2', 0.99)
+                            },
+                            "pierce_model" : pierce_data.get("pierce_or_not", "false")
+                        }
+
+            print(f"the Piercing parameters from RLAF are {pierce_params}")
+            return pierce_params
+
+        # trigger RLAF 
+
+
+        def trigger_RLAF(config):
+
+            run_id = trigger_pipeline(config)
+            config["run_id"] = run_id
+
+            while True:
+                pipeline_status = get_pipeline_status(config)
+                print(f"Current pipeline status: {pipeline_status}")
+                if pipeline_status == 'SUCCEEDED':
+                    print("RLAF Pipeline execution completed")
+                    break
+                elif pipeline_status in ['FAILED', 'ERROR']:
+                    print(f"Pipeline execution failed with status: {pipeline_status}")
+                    break
+                else:
+                    time.sleep(60)
+
+        
+
+
+        # Example usage:
+
+        current_timestamp = str(int(time.time()))
+
         # def RLAF(accuracy, prev_accuracy):
         #     pierce_params = {
         #         "epochs": np.random.randint(2, 11),
@@ -302,6 +399,40 @@ implementation:
         #     return pierce_params
                 
         
+        
+        def RLAF(accuracy, model, x_test, y_test, pierce_params={}):
+            prev_accuracy = accuracy
+            accuracy = get_accuracy(model, x_test, y_test)
+
+            current_timestamp = str(int(time.time()))
+            epochs = pierce_params.get("epochs", 0)
+            optim_params = pierce_params.get("optimiser_params", {}) 
+            b1 = optim_params.get("beta_1", 0)
+            b2 = optim_params.get("beta_2", 0)
+            lr = optim_params.get("learning_rate", 0)
+            new_pierce2rfal_entry = {
+                "actions": [
+                    {"accuracy": accuracy, "prev_accuracy": prev_accuracy, "b1": b1, "b2": b2, "epochs": epochs, "lr": lr}
+                ],
+                "timestamp": current_timestamp,
+                "trained_accuracy": 0.1
+            }
+
+            access_token = get_access_token()
+            append_to_pierce2rfal(access_token, new_pierce2rfal_entry) 
+            
+            config = {
+                "pipeline_id" : "0197a78b-f834-7597-87ce-df30022fcfd2",
+                "experiment_id" : "37e5cbe2-9fd7-4bc1-ad49-86d8a4a2c2e3"
+            }
+            
+            config["access_token"] = access_token
+
+            pierce_params = get_pierce_params() 
+
+            return pierce_params, accuracy 
+
+
 
         def pierce_model(model, new_x, new_y):
             
@@ -311,50 +442,50 @@ implementation:
             train_dataset, test_dataset = data_prep(x_train, x_test, y_train, y_test)
             x_test = x_test.astype(float) / 255
             y_test = y_test.astype(int)
-            accuracy = get_accuracy(model, x_test,y_test)
             prev_accuracy = 0
-            pierce_params = RLAF(accuracy, prev_accuracy)
+            
+            pierce_params, accuracy = RLAF(prev_accuracy, model, x_test, y_test)
+
             while pierce_params['pierce_model']:
+                prev_accuracy = accuracy
                 epochs = pierce_params.get("epochs", 5)
                 model.update_pierce_params(pierce_params)
                 history = model.fit(train_dataset, epochs=epochs)
-                accuracy = get_accuracy(model, x_test,y_test)
-                pierce_params = RLAF(accuracy, prev_accuracy)
-                prev_accuracy = accuracy 
+                pierce_params, accuracy = RLAF(prev_accuracy, model, x_test, y_test, pierce_params)
 
-        
-        
-        
-        # def pierce_model(model, new_x, new_y, pierce_params):
-        #     model.update_pierce_params(pierce_params)
-        #     epochs = pierce_params.get("epochs", 5)
-        #     required_accuracy = pierce_params.get("accuracy", 0.9)
-
+        # def pierce_model(model, new_x, new_y):
+            
         #     x_train, x_test, y_train, y_test = train_test_split(
-        #         new_x, new_y, test_size=0.3, random_state=42, stratify=new_y
-        #     )
-        #     train_dataset, _ = data_prep(x_train, x_test, y_train, y_test)
-
-        #     model.fit(train_dataset, epochs=epochs)
-        #     prev_accuracy = 0
+        #     new_x, new_y, test_size=0.3, random_state=42, stratify=new_y
+        # )
+        #     train_dataset, test_dataset = data_prep(x_train, x_test, y_train, y_test)
         #     x_test = x_test.astype(float) / 255
         #     y_test = y_test.astype(int)
-        #     accuracy = get_accuracy(model, x_test, y_test)
-        #     print(f"the expected accuracy{required_accuracy}")
-        #     print(f"The obtained accuracy {accuracy}")
-        #     while accuracy < required_accuracy and accuracy > prev_accuracy:
-        #         prev_accuracy = accuracy
-        #         params = pierce_params["optimiser_params"]
-        #         params["learning_rate"] = np.random.uniform(0.005, 0.05)
-        #         params["beta_1"] = np.random.uniform(0.9, 0.99)
-        #         params["beta_2"] = np.random.uniform(0.99, 0.9999)
-        #         pierce_params["optimiser"] = pierce_params["optimiser_class"](**params)
-        #         model.update_pierce_params(pierce_params)
-        #         model.fit(train_dataset, epochs=epochs)
-        #         accuracy = get_accuracy(model, x_test, y_test)
-        #         print(f"the expected accuracy{required_accuracy}")
-        #         print(f"The obtained accuracy {accuracy}")
+        #     accuracy = get_accuracy(model, x_test,y_test)
+        #     prev_accuracy = 0
+                
+        #     current_timestamp = str(int(time.time()))
 
+        #     new_pierce2rfal_entry = {
+        #         "actions": [
+        #             # {"accuracy": 0.2, "prev_accuracy": 0.1, "b1": 0.9, "b2": 0.99, "epochs": 9, "lr": 0.05}
+        #             {"accuracy": accuracy, "prev_accuracy": 0 }
+        #         ],
+        #         "timestamp": current_timestamp,
+        #         "trained_accuracy": 0.1
+        #     }
+
+        #     # pierce_params = RLAF(accuracy, prev_accuracy)
+
+        #     while pierce_params['pierce_model']:
+        #         epochs = pierce_params.get("epochs", 5)
+        #         model.update_pierce_params(pierce_params)
+        #         history = model.fit(train_dataset, epochs=epochs)
+        #         accuracy = get_accuracy(model, x_test,y_test)
+        #         pierce_params = RLAF(accuracy, prev_accuracy)
+        #         prev_accuracy = accuracy 
+
+        
 
 
 
@@ -395,18 +526,7 @@ implementation:
         x_splits = np.load(args.x_pierce_splits, allow_pickle=True)
         y_splits = np.load(args.y_pierce_splits, allow_pickle=True)
 
-        # Define piercing parameters
-        # pierce_params = {
-        #     "epochs": 5,
-        #     "accuracy": 0.5,
-        #     "optimiser_class": Adam,
-        #     "optimiser_params": {
-        #         "learning_rate": 0.01,
-        #         "beta_1": 0.9,
-        #         "beta_2": 0.99
-        #     }
-        # }
-
+    
         # Perform piercing on each split
         new_data_id = 1
         for new_x, new_y in zip(x_splits, y_splits):
