@@ -232,7 +232,7 @@ implementation:
       - --train_dataset
       - {inputPath: train_dataset}
     #   - --num_epochs
-      - {inputPath: num_epochs}
+      - {inputValue: num_epochs}
       - --trained_model
       - {outputPath: trained_model}
       # - /tmp/outputs/trained_model/data.keras
