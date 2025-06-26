@@ -422,7 +422,8 @@ implementation:
             append_to_pierce2rfal(access_token, new_pierce2rfal_entry) 
             
             config = {
-                "pipeline_id" : "0197aac2-14ca-7f5b-902b-70ae9035ea30",
+                # "pipeline_id" : "0197aac2-14ca-7f5b-902b-70ae9035ea30",
+                "pipeline_id" : "0197ab1d-cb4c-7d06-9e68-3846086e9f9b",
                 "experiment_id" : "37e5cbe2-9fd7-4bc1-ad49-86d8a4a2c2e3"
             }
             
