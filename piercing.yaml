@@ -427,7 +427,7 @@ implementation:
             }
             
             config["access_token"] = access_token
-
+            trigger_RLAF(config)
             pierce_params = get_pierce_params() 
 
             return pierce_params, accuracy 
