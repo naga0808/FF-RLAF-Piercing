@@ -220,7 +220,7 @@ implementation:
 
             response = requests.request("POST", url, headers=headers, data=payload)
             response = response.json()
-            print(response)
+            # print(response)
             # print(response.text)
             return response['runId']
 
@@ -259,6 +259,7 @@ implementation:
             results = accuracy_score(preds, y_test)
             print(f"Test Accuracy score : {results * 100}%")
             return results
+
 
         def get_instances(access_token):
             instances_url = "https://ig.aidtaas.com/pi-entity-instances-service/v3.0/schemas/685a9dcd08232436a767c98a/instances/list"
@@ -323,11 +324,11 @@ implementation:
             token = get_access_token()
 
             rlaf_to_pierce_data = get_instances(token)
-            print(json.dumps(rlaf_to_pierce_data["content"], indent=4))
+            # print(json.dumps(rlaf_to_pierce_data["content"], indent=4))
             expected_accuracy = rlaf_to_pierce_data["content"][-1].get("baseline_score", 0.9)
             pierce_data = rlaf_to_pierce_data['content'][-1]["rlaf2pierce"][-1]
 
-            print(pierce_data)
+            # print(pierce_data)
             pierce_parameters = pierce_data['actions'][-1]
             pierce_or_not = pierce_data.get("pierce_or_not", "false")
 
